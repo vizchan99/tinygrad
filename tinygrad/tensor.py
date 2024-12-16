@@ -13,7 +13,6 @@ from tinygrad.device import Device, Buffer, BufferSpec
 from tinygrad.engine.realize import run_schedule
 from tinygrad.engine.memory import memory_planner
 from tinygrad.engine.schedule import ScheduleItem, create_schedule_with_vars
-
 # **** start with two base classes, Tensor and Function ****
 
 class Function:
@@ -105,6 +104,39 @@ def _masked_setitem(target:Tensor, values:Tensor, mask:Tensor, axes:Tuple[int, .
 
 ReductionStr = Literal["mean", "sum", "none"]
 
+class LazyBufferCreator:
+  import numpy as np
+  def __init__(self, dtype: Optional[DType], device: Union[str, Tuple[str, ...]]):
+    self.dtype, self.device = dtype, device
+    self.handlers: Dict[Type, Callable] = {
+      MultiLazyBuffer: self._handle_UOp_MultiLazyBuffer, list: self._handle_sequence, tuple: self._handle_sequence,
+      type(None): lambda _: _metaop(Ops.EMPTY, (0,), self.dtype or dtypes.default_float, self.device),
+      bytes: lambda d: _frompy(d, dtypes.uint8 if self.dtype is None else self.dtype), UOp: self._handle_UOp_MultiLazyBuffer}
+  def create(self, data: Union[None, ConstType, bytes, List, Tuple, UOp, MultiLazyBuffer, 'np.ndarray', pathlib.Path]) -> Union[UOp, MultiLazyBuffer]:
+    handler = self.handlers.get(type(data))
+    if handler: return handler(data)
+    if (str(type(data)) == "<class 'numpy.ndarray'>"): return self._handle_numpy(data)
+    if isinstance(data, get_args(ConstType)): return _metaop(Ops.CONST, tuple(), self.dtype or dtypes.from_py(data), self.device, data)
+    if isinstance(data, pathlib.Path):
+      self.dtype = self.dtype or dtypes.uint8
+      return _metaop(Ops.EMPTY, (data.stat().st_size // self.dtype.itemsize,), self.dtype, f"DISK:{data.resolve()}")
+    raise RuntimeError(f"can't create Tensor from {data!r} with type {type(data)}")
+  def _handle_UOp_MultiLazyBuffer(self, data: Union[UOp, MultiLazyBuffer]):
+    assert self.dtype is None or self.dtype == data.dtype, "dtype doesn't match, and casting isn't supported"
+    if isinstance(data, UOp) and data.op is Ops.BIND: return _metaop(Ops.CONST, tuple(), self.dtype or data.dtype, self.device, data)
+    return data
+  def _handle_sequence(self, data: Union[list, tuple]):
+    if self.dtype is None:
+      if (d := fully_flatten(data)) and all(isinstance(s, bool) for s in d): self.dtype = dtypes.bool
+      else: self.dtype = dtypes.default_int if d and all_int(d) else dtypes.default_float  # NOTE: this works because all_int([True, False]) is True
+    if self.dtype == dtypes.bfloat16: return Tensor(_frompy(data, dtypes.float32), device=self.device).cast(dtypes.bfloat16).lazydata
+    return _frompy(data, self.dtype)
+  def _handle_numpy(self, data):
+    import numpy as np
+    assert isinstance(data, np.ndarray), f"expected numpy.ndarray, got {data}"
+    if data.shape == (): return _metaop(Ops.CONST, tuple(), self.dtype or _from_np_dtype(data.dtype), self.device, data.item())
+    return _fromnp(data.astype(npdtype) if self.dtype is not None and (npdtype:=_to_np_dtype(self.dtype)) is not None else data)  # type: ignore [name-defined]
+
 class Tensor(SimpleMathTrait):
   """
   A `Tensor` is a multi-dimensional matrix containing elements of a single data type.
@@ -136,33 +168,8 @@ class Tensor(SimpleMathTrait):
 
     # internal variable used for autograd graph construction
     self._ctx: Optional[Function] = None
-
-    # create a LazyBuffer from the different types of inputs
-    if isinstance(data, (UOp, MultiLazyBuffer)):
-      assert dtype is None or dtype==data.dtype, "dtype doesn't match, and casting isn't supported"
-      # NOTE: this is here because LazyBuffer = UOp
-      if isinstance(data, UOp) and data.op is Ops.BIND: data = _metaop(Ops.CONST, tuple(), dtype or data.dtype, device, data)
-    elif data is None: data = _metaop(Ops.EMPTY, (0,), dtype or dtypes.default_float, device)
-    elif isinstance(data, get_args(ConstType)): data = _metaop(Ops.CONST, tuple(), dtype or dtypes.from_py(data), device, data)
-    elif isinstance(data, bytes): data = _frompy(data, dtypes.uint8 if dtype is None else dtype)
-    elif isinstance(data, (list, tuple)):
-      if dtype is None:
-        if (d := fully_flatten(data)) and all(isinstance(s, bool) for s in d): dtype = dtypes.bool
-        else: dtype = dtypes.default_int if d and all_int(d) else dtypes.default_float  # NOTE: this works because all_int([True, False]) is True
-      if dtype == dtypes.bfloat16: data = Tensor(_frompy(data, dtypes.float32), device=device).cast(dtypes.bfloat16).lazydata
-      else: data = _frompy(data, dtype)
-    elif str(type(data)) == "<class 'numpy.ndarray'>":
-      import numpy as np
-      assert isinstance(data, np.ndarray), f"expected np.ndarray, got {data}"
-      if data.shape == (): data = _metaop(Ops.CONST, tuple(), dtype or _from_np_dtype(data.dtype), device, data.item())
-      else: data = _fromnp(data.astype(npdtype) if dtype is not None and (npdtype:=_to_np_dtype(dtype)) is not None else data)  # type: ignore [name-defined]
-    elif isinstance(data, pathlib.Path):
-      dtype = dtype or dtypes.uint8
-      data = _metaop(Ops.EMPTY, (data.stat().st_size // dtype.itemsize,), dtype, f"DISK:{data.resolve()}")
-
-    # by this point, it has to be a LazyBuffer
-    if not isinstance(data, (UOp, MultiLazyBuffer)): raise RuntimeError(f"can't create Tensor from {data!r} with type {type(data)}")
-
+    # creating the lazybuffer from different datatypes
+    data = LazyBufferCreator(dtype=dtype, device=device).create(data)
     # data might be on a different device
     if isinstance(device, str): self.lazydata:Union[UOp, MultiLazyBuffer] = data if data.device == device else data.copy_to_device(device)
     # if device is a tuple, we should have/construct a MultiLazyBuffer
